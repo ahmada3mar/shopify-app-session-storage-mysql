@@ -2,111 +2,113 @@
 
 Object.defineProperty(exports, '__esModule', { value: true });
 
+var mysql = require('mysql2/promise');
 var shopifyApi = require('@shopify/shopify-api');
-var migrations = require('./migrations.js');
-var mysqlConnection = require('./mysql-connection.js');
-var mysqlMigrator = require('./mysql-migrator.js');
+
+function _interopDefaultLegacy (e) { return e && typeof e === 'object' && 'default' in e ? e : { 'default': e }; }
+
+var mysql__default = /*#__PURE__*/_interopDefaultLegacy(mysql);
 
 const defaultMySQLSessionStorageOptions = {
-  sessionTableName: 'shopify_sessions',
-  migratorOptions: {
-    migrationDBIdentifier: 'shopify_sessions_migrations',
-    migrationNameColumnName: 'migration_name'
-  }
+  sessionTableName: 'shopify_sessions'
 };
 class MySQLSessionStorage {
   static withCredentials(host, dbName, username, password, opts) {
     return new MySQLSessionStorage(new URL(`mysql://${encodeURIComponent(username)}:${encodeURIComponent(password)}@${host}/${encodeURIComponent(dbName)}`), opts);
   }
   constructor(dbUrl, opts = {}) {
+    this.dbUrl = dbUrl;
     this.ready = void 0;
-    this.internalInit = void 0;
     this.options = void 0;
     this.connection = void 0;
-    this.migrator = void 0;
-    this.dbUrl = void 0;
+    if (typeof this.dbUrl === 'string') {
+      this.dbUrl = new URL(this.dbUrl);
+    }
     this.options = {
       ...defaultMySQLSessionStorageOptions,
       ...opts
     };
-    this.dbUrl = dbUrl.toString();
-    this.internalInit = this.init();
-    this.migrator = new mysqlMigrator.MySqlSessionStorageMigrator(this.connection, this.options.migratorOptions, migrations.migrationList);
-    this.ready = this.migrator.applyMigrations(this.internalInit);
+    this.ready = this.init;
   }
   async storeSession(session) {
-    await this.ready;
-    this.init();
+    await this.ready();
+
     // Note milliseconds to seconds conversion for `expires` property
     const entries = session.toPropertyArray().map(([key, value]) => key === 'expires' ? [key, Math.floor(value / 1000)] : [key, value]);
     const query = `
       REPLACE INTO ${this.options.sessionTableName}
       (${entries.map(([key]) => key).join(', ')})
-      VALUES (${entries.map(() => `${this.connection.getArgumentPlaceholder()}`).join(', ')})
+      VALUES (${entries.map(() => `?`).join(', ')})
     `;
-    await this.connection.query(query, entries.map(([_key, value]) => value));
+    await this.query(query, entries.map(([_key, value]) => value));
     this.disconnect();
     return true;
   }
   async loadSession(id) {
-    await this.ready;
-    this.init();
+    await this.ready();
     const query = `
       SELECT * FROM \`${this.options.sessionTableName}\`
-      WHERE id = ${this.connection.getArgumentPlaceholder()};
+      WHERE id = ?;
     `;
-    const [rows] = await this.connection.query(query, [id]);
+    const [rows] = await this.query(query, [id]);
     if (!Array.isArray(rows) || (rows === null || rows === void 0 ? void 0 : rows.length) !== 1) return undefined;
     const rawResult = rows[0];
     this.disconnect();
     return this.databaseRowToSession(rawResult);
   }
   async deleteSession(id) {
-    await this.ready;
-    this.init();
+    await this.ready();
     const query = `
       DELETE FROM ${this.options.sessionTableName}
-      WHERE id = ${this.connection.getArgumentPlaceholder()};
+      WHERE id = ?;
     `;
-    await this.connection.query(query, [id]);
+    await this.query(query, [id]);
     this.disconnect();
     return true;
   }
   async deleteSessions(ids) {
-    await this.ready;
-    this.init();
+    await this.ready();
     const query = `
       DELETE FROM ${this.options.sessionTableName}
-      WHERE id IN (${ids.map(() => `${this.connection.getArgumentPlaceholder()}`).join(',')});
+      WHERE id IN (${ids.map(() => '?').join(',')});
     `;
-    await this.connection.query(query, ids);
+    await this.query(query, ids);
     this.disconnect();
     return true;
   }
   async findSessionsByShop(shop) {
-    await this.ready;
-    this.init();
+    await this.ready();
     const query = `
       SELECT * FROM ${this.options.sessionTableName}
-      WHERE shop = ${this.connection.getArgumentPlaceholder()};
+      WHERE shop = ?;
     `;
-    const [rows] = await this.connection.query(query, [shop]);
+    const [rows] = await this.query(query, [shop]);
     if (!Array.isArray(rows) || (rows === null || rows === void 0 ? void 0 : rows.length) === 0) return [];
     const results = rows.map(row => {
       return this.databaseRowToSession(row);
     });
-    this.disconnect();
+    this.disconnect();;
     return results;
   }
   async disconnect() {
-    await this.connection.disconnect();
+    await this.connection.end();
   }
   async init() {
-    this.connection = new mysqlConnection.MySqlConnection(this.dbUrl, this.options.sessionTableName);
+    this.connection = await mysql__default["default"].createConnection(this.dbUrl.toString());
     await this.createTable();
   }
+  async hasSessionTable() {
+    const query = `
+      SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME = ? AND TABLE_SCHEMA = ?;
+    `;
+
+    // Allow multiple apps to be on the same host with separate DB and querying the right
+    // DB for the session table exisitence
+    const [rows] = await this.query(query, [this.options.sessionTableName, this.connection.config.database]);
+    return Array.isArray(rows) && rows.length === 1;
+  }
   async createTable() {
-    const hasSessionTable = await this.connection.hasTable(this.options.sessionTableName);
+    const hasSessionTable = await this.hasSessionTable();
     if (!hasSessionTable) {
       const query = `
         CREATE TABLE ${this.options.sessionTableName} (
@@ -120,8 +122,12 @@ class MySQLSessionStorage {
           accessToken varchar(255)
         )
       `;
-      await this.connection.query(query);
+      await this.query(query);
+      this.disconnect();
     }
+  }
+  query(sql, params = []) {
+    return this.connection.query(sql, params);
   }
   databaseRowToSession(row) {
     // convert seconds to milliseconds prior to creating Session object
